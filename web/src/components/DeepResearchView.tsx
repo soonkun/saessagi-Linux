@@ -352,9 +352,12 @@ export function DeepResearchView({ desktop }: { desktop?: boolean }): React.Reac
   }, [running]);
   const stalled = running && lastEventAt > 0 && (now - lastEventAt) / 1000 > STALL_SEC;
 
+  // 목록은 **최신이 맨 위**라 새 리서치가 끝나면 위로 올라가야 한다 (CR-73).
+  // 예전에는 맨 아래로 내렸는데, 그러면 방금 끝난 건이 화면 밖으로 밀려났다.
+  // 상세 화면(보고서 한 건)에서는 위에서부터 읽으므로 마찬가지로 맨 위가 맞다.
   useEffect(() => {
-    threadRef.current?.scrollTo({ top: threadRef.current.scrollHeight, behavior: "smooth" });
-  }, [turns.length, steps.length]);
+    threadRef.current?.scrollTo({ top: 0, behavior: "smooth" });
+  }, [turns.length, openRun]);
 
   // 진행 과정 상자는 **자기 안에서** 최신 줄로 따라간다. 상자에 스크롤을 두면
   // 전체를 되짚어 볼 수 있고, 도는 동안에는 마지막 줄이 보여야 한다.
@@ -686,7 +689,13 @@ export function DeepResearchView({ desktop }: { desktop?: boolean }): React.Reac
   // ── 화면: 방 (대화) ────────────────────────────────────────────────────────
 
   return (
-    <div className="dr-column" style={{ display: "flex", flexDirection: "column", minHeight: 0 }}>
+    // 부모(ChatPanel/DesktopView)는 `flex:1 · overflow:hidden`인 flex 컬럼이다.
+    // 여기서 `height:100%`를 안 주면 이 칼럼이 내용 높이로만 자라서, 목록 바로 뒤에
+    // 입력창이 붙고 그 아래가 빈 공간으로 남는다 (CR-73).
+    <div
+      className="dr-column"
+      style={{ display: "flex", flexDirection: "column", height: "100%", minHeight: 0 }}
+    >
       <div
         style={{
           display: "flex",
@@ -959,11 +968,23 @@ export function DeepResearchView({ desktop }: { desktop?: boolean }): React.Reac
         )}
       </div>
 
-      {/* 입력 알약 — 새싹이 대화창과 같은 모양. 첨부는 **RAG에 등록하지 않는다.** */}
-      <div style={{ padding: "10px 14px", borderTop: "1px solid var(--color-border)", flexShrink: 0 }}>
+      {/* 입력 알약 — 새싹이 대화창과 같은 모양 (CR-73). 화면 **아래에 고정**된다.
+          첨부는 **RAG에 등록하지 않는다** — 텍스트만 읽는다. */}
+      <div
+        style={{
+          padding: "10px 14px 12px",
+          borderTop: "1px solid var(--color-border)",
+          flexShrink: 0,
+          display: "flex",
+          flexDirection: "column",
+          alignItems: "center",
+        }}
+      >
         {file && (
           <div
             style={{
+              alignSelf: "flex-start",
+              maxWidth: 860,
               display: "inline-flex",
               alignItems: "center",
               gap: 6,
@@ -990,13 +1011,19 @@ export function DeepResearchView({ desktop }: { desktop?: boolean }): React.Reac
         )}
         <div
           style={{
+            position: "relative",
+            width: "100%",
+            // 새싹이 대화창과 같은 값 (ChatPanel의 composer).
+            maxWidth: 860,
             display: "flex",
             alignItems: "flex-end",
-            gap: 8,
+            gap: 6,
+            background: "var(--color-panel)",
             border: "1px solid var(--color-border)",
-            borderRadius: 22,
-            padding: "6px 8px 6px 12px",
-            background: "var(--color-bg)",
+            // 한 줄일 때 알약이 되는 값(높이 52 ÷ 2). 999로 두면 여러 줄에서 양끝이 부푼다.
+            borderRadius: 26,
+            padding: "6px 8px 6px 6px",
+            boxShadow: "0 1px 3px rgba(0,0,0,0.06)",
           }}
         >
           <input
@@ -1015,10 +1042,16 @@ export function DeepResearchView({ desktop }: { desktop?: boolean }): React.Reac
               border: "none",
               cursor: running ? "default" : "pointer",
               color: "var(--color-text-muted)",
-              padding: 4,
+              width: 34,
+              height: 34,
+              borderRadius: "50%",
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "center",
+              flexShrink: 0,
             }}
           >
-            <Paperclip size={16} />
+            <Paperclip size={18} />
           </button>
           <textarea
             value={prompt}
