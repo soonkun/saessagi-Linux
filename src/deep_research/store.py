@@ -43,7 +43,9 @@ LIMITS: dict[str, tuple[int, int]] = {
     "sub_queries": (1, 12),
     "top_k_per_query": (1, 15),
     "gap_rounds": (0, 3),
-    "max_evidence_chunks": (5, 40),
+    # 상한 80: service._MAX_EVIDENCE_CHARS(90,000자)가 80건을 담을 수 있게 잡혀 있다.
+    # 둘은 한 쌍이다 — 여기를 올리면 그쪽도 같이 올려야 근거가 조용히 잘리지 않는다.
+    "max_evidence_chunks": (5, 80),
 }
 
 _SCHEMA = """

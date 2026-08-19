@@ -1502,7 +1502,7 @@ function InstructionsScreen({
             "보고서에 쓸 근거 상한",
             "max_evidence_chunks",
             5,
-            40,
+            80,
             "위에서 모은 자료 중 실제로 보고서 작성에 넣을 최대 건수. 여기서 잘리므로, 앞 숫자만 올려도 결과가 안 늘어날 수 있습니다."
           )}
         </div>

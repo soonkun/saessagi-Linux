@@ -202,12 +202,6 @@ def _clean_for_memory(text: str) -> str:
     return out.strip()
 
 
-def _marker_id(marker: str) -> str:
-    """`[[doc:X]]` / `[[note:X]]` → `X`. 형식이 아니면 빈 문자열."""
-    m = re.fullmatch(r"\[\[(?:doc|note):(.+)\]\]", marker or "", re.S)
-    return m.group(1).strip() if m else ""
-
-
 def _norm_id(s: str) -> str:
     """doc_id 비교용 정규화 — LLM이 흘린 공백·구두점을 무시한다."""
     return re.sub(r"[\s·.,()\[\]_-]+", "", s or "").lower()
@@ -259,19 +253,26 @@ def _resolve_inline_markers(text: str, valid_markers: list[str]) -> tuple[str, i
         kept += 1
         return f"[[doc:{cand}]]"
 
-    out = re.sub(r"\[\[[^\[\]]*\]{0,2}", _fix, text)
+    # 내용에 `]`가 하나 들어가도 끊기지 않게 **`]]`가 나올 때까지** 먹는다.
+    # `[^\[\]]*`로 두면 `[[doc:[이암허브]농식품…]]`이 `[[doc:`에서 매치가 끊겨 마커가
+    # 통째로 지워졌다. E-106에서 고쳤다고 기록돼 있었지만 실제로는 인라인에서 작동한 적이
+    # 없고, 끝에 몰아 붙이는 폴백이 가려 주고 있었다 — 그 폴백을 없애면서 드러났다.
+    out = re.sub(r"\[\[(?:(?!\]\])[\s\S])*\]{0,2}", _fix, text)
     out = re.sub(r"[ \t]{2,}", " ", out)
     out = re.sub(r" +\n", "\n", out)
     out = out.strip()
 
-    # 모델이 빠뜨린 자료를 **끝에 보탠다** (사용자 요청: "관련된 근거를 참고했으면 다
-    # 달아야지"). 검색된 자료는 전부 LLM 컨텍스트에 들어갔으므로 실제로 참고된 것이다.
-    # 모델은 그중 일부에만 마커를 다는데(실측 8건 중 3건), 나머지를 버리면 사용자가
-    # 그 자료에 접근할 방법이 없다. 본문 인용은 제자리에 두고 남은 것만 뒤에 붙인다.
-    leftover = [m for m in valid_markers if _marker_id(m) and _marker_id(m) not in used]
-    if leftover:
-        out = (out + "\n\n" + " ".join(leftover)).strip()
-        kept += len(leftover)
+    # 인용 안 된 자료를 끝에 보태던 동작은 **없앴다.**
+    #
+    # 예전 근거는 "검색된 자료는 전부 LLM 컨텍스트에 들어갔으므로 실제로 참고된 것"이었는데
+    # 그게 사실이 아니다. 컨텍스트에 넣는 것과 모델이 답변에 쓰는 것은 다르다. 검색은
+    # top_k=10건을 가져오고 모델은 그중 한둘만 쓰는데, 10건이 전부 칩으로 붙으니 사용자에게는
+    # "참조했다"로 보이면서 본문에는 반영이 없었다 (사용자 지적: "분명 참조한 문서가 있는데
+    # 본문엔 반영을 안한 듯하게 나오거든"). 딥 리서치에서도 같은 실측이 나왔다 — 근거 40건 중
+    # 본문이 실제 인용한 것은 22건.
+    #
+    # 이제 **본문에서 실제로 인용하고 검증까지 통과한 것만** 남는다. 모델이 인용을 빠뜨려
+    # 자료가 안 보이면 인용을 시키도록 프롬프트에서 고칠 문제지, 목록을 부풀려 가릴 문제가 아니다.
     return out, kept
 
 
@@ -959,23 +960,21 @@ def _make_adapter_class() -> type:
                 markers = getattr(self, "_last_cited_markers", []) or []
                 # CR-64: 인용 마커를 **본문 제자리에** 남긴다. 예전에는 전부 지우고 답변
                 # 끝에 몰아 붙여서, 어느 문장이 어느 자료 근거인지 알 수 없었다.
-                # 검증에서 살아남은 게 하나도 없을 때만 예전처럼 끝에 붙인다 —
-                # 그렇지 않으면 자료 접근 경로가 통째로 사라진다.
+                #
+                # **검색된 문서를 답변 끝에 몰아 붙이던 폴백은 없앴다** (사용자 지적:
+                # "분명 참조한 문서가 있는데 본문엔 반영을 안 한 듯하게 나온다").
+                # 검색은 top_k=10건을 가져오는데 모델은 그중 한둘만 쓴다. 그런데도 10건이
+                # 전부 칩으로 붙어서, 답변에 반영되지 않은 자료가 근거처럼 보였다.
+                # 이제 **모델이 본문에서 실제로 인용하고 검증까지 통과한 것만** 남는다.
                 inline_text, inline_kept = _resolve_inline_markers(full_text, markers)
-                if inline_kept > 0:
-                    display = inline_text
-                elif markers:
-                    marker_str = "".join(markers)
-                    display = f"{clean_text} {marker_str}".strip() if clean_text else marker_str
-                else:
-                    display = clean_text
+                display = inline_text if inline_kept > 0 else clean_text
                 if markers:
                     logger.info(
-                        "인용 마커: LLM이 쓴 것 %d개 → 검증 통과 %d개 · 검색 문서 %d개 (%s)",
+                        "인용 마커: LLM이 쓴 것 %d개 → 검증 통과 %d개 · 검색 문서 %d개 (미인용 %d건 미표시)",
                         full_text.count("[["),
                         inline_kept,
                         len(markers),
-                        "인라인 유지" if inline_kept else "끝에 부착(폴백)",
+                        max(0, len(markers) - inline_kept),
                     )
                 # 의도 안내·노트 작성으로 캐릭터 상태를 바꿨다면 작업 종료 시 [neutral] 복귀.
                 # 단, 직후 강제 저장 폴백이 돌 예정이면 폴백 완료 메시지가 복귀를 담당한다.

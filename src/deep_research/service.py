@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import time
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
@@ -68,10 +69,41 @@ def _is_note(hit: SearchHit) -> bool:
     )
 
 
+# 인용 마커. `[3]`뿐 아니라 `[6, 18]`처럼 묶어 쓰는 경우가 실제로 많다 —
+# 단순히 `\[(\d+)\]`로 뽑으면 묶음 인용이 통째로 누락된다(실측 22건 중 5건).
+_CITE_RE = re.compile(r"\[(\d+(?:\s*,\s*\d+)*)\]")
+
+
+def _cited_numbers(report: str, total: int) -> list[int]:
+    """보고서 본문이 **실제로 인용한** 근거 번호만 골라낸다.
+
+    목록에만 있고 본문에서 안 쓰인 자료를 출처로 내보내면, 사용자에게는 "참조했다"로
+    보이지만 답변에는 반영이 없다. 실측에서 40건 중 18건이 그랬다.
+    범위 밖 번호(모델이 지어낸 인용)는 버린다.
+    """
+    nums: set[int] = set()
+    for group in _CITE_RE.findall(report or ""):
+        for part in group.split(","):
+            try:
+                nums.add(int(part.strip()))
+            except ValueError:  # 정규식이 통과시킨 형태만 오므로 사실상 도달 불가
+                continue
+    return sorted(n for n in nums if 1 <= n <= total)
+
+
 # 근거 예산 기본값 (스펙 §3). 방 설정이 없을 때의 폴백이자 상한 계산의 기준.
 _TOP_K_PER_QUERY = 5
 _MAX_EVIDENCE_CHUNKS = 24
-_MAX_EVIDENCE_CHARS = 14_000
+# 근거 블록 총량 상한. **방이 고를 수 있는 최대치가 다 들어가는 크기여야 한다.**
+# 14,000자였을 때 실제로 샜다: 방은 근거 40건을 골랐는데 청크 중앙값이 977자(실측,
+# 4천 청크 표본)라 프롬프트에는 14건만 들어갔고, 나머지 26건은 읽히지도 않은 채
+# 참고문헌 목록에만 올랐다. 모델이 보고서에 직접 적어 항의했다 —
+# "[11]~[24]번 문서는 원문이 제공되지 않아 분석에서 제외되었습니다".
+# 그래서 store.LIMITS["max_evidence_chunks"] 상한(80)에서 거꾸로 잡는다:
+# 80건 × 1,017자(중앙값+헤더) = 81,360자. 90,000자면 여유가 있다.
+# gemma4:31b 컨텍스트 262,144토큰 대비 ~57k토큰(22%)이라 아직 한참 남는다.
+# 상한을 줄일 때는 store.LIMITS도 같이 줄여야 한다 — 안 그러면 위 누수가 되살아난다.
+_MAX_EVIDENCE_CHARS = 90_000
 _MAX_SUB_QUERIES = 6
 _MAX_GAP_QUERIES = 3
 _MAX_INPUT_CHARS = 30_000
@@ -84,7 +116,10 @@ _SYNTHESIS_TIMEOUT = 600.0
 _SYNTHESIS_TICK_SEC = 10.0
 # 대기 중 "아직 줄 서 있다"를 알리는 간격.
 _QUEUE_TICK_SEC = 5.0
-_SYNTHESIS_MAX_TOKENS = 4096
+# 4096일 때 보고서가 실제로 잘렸다 — 최근 4건 중 2건이 문장·표 셀 중간에서 끊겼다
+# (6,494자 / 4096토큰 = 1.586자·토큰, 한글+마크다운 비율과 일치). 근거를 늘리면 확실해진다.
+# 8192 × 1.586 ≈ 13,000자. 실측 생성 속도 ~67tok/s이라 생성 시간은 61초 → 약 123초.
+_SYNTHESIS_MAX_TOKENS = 8192
 
 
 class _CompletionAgent(Protocol):
@@ -319,6 +354,11 @@ class DeepResearchService:
 
         # 4. 종합
         sources = self._rank_sources(pool, profile.max_evidence_chunks)
+        # 블록을 먼저 만들고 sources를 실제로 담긴 것으로 갈아끼운다 — 진행 메시지·done
+        # 페이로드·저장되는 출처 목록·완료 로그가 전부 같은 수(=모델이 읽은 수)를 말한다.
+        # 0건 판정도 이 뒤에 둔다: 검색이 0건인 경우와 전부 상한에 잘려 나간 경우 모두
+        # "모델에 줄 근거가 없다"로 같으며, 후자를 놓치면 근거 없는 보고서가 나간다.
+        evidence_block, sources = self._evidence_block(sources)
         if not sources:
             logger.info("DeepResearch: 근거 0건 — 보고서 생성 생략 (방=%s)", profile.project_id)
             yield {
@@ -333,7 +373,6 @@ class DeepResearchService:
             "stage": "synthesis",
             "message": f"근거 {len(sources)}건으로 보고서 작성 중... (수 분 소요될 수 있음)",
         }
-        evidence_block = self._evidence_block(sources)
         system, user = synthesis_prompts(profile.instructions, user_input, evidence_block)
         # 보고서 생성은 수 분짜리 단일 호출이라, 그냥 await하면 그동안 스트림에 아무것도
         # 흐르지 않는다. 화면에서는 진행 중인지 서버가 죽은 것인지 구분할 수 없다
@@ -364,17 +403,32 @@ class DeepResearchService:
             yield {"stage": "error", "message": f"보고서 생성 실패: {exc}"}
             return
 
+        # 출처는 **본문이 실제로 인용한 것만** 내보낸다. 번호는 보고서에 적힌 그대로
+        # 유지한다 — 다시 매기면 본문의 [n]과 목록이 어긋난다.
+        cited = _cited_numbers(report, len(sources))
         logger.info(
-            "DeepResearch 완료: 방=%s, 질의=%d, 근거=%d청크, 보고서=%d자",
+            # 근거 문자수를 같이 남긴다 — 이번 누수의 근본 원인이 어떤 로그에도 어떤
+            # 화면에도 안 보이는 예산이었다.
+            "DeepResearch 완료: 방=%s, 질의=%d, 근거=%d청크(%d자), 인용=%d건, 보고서=%d자",
             profile.project_id,
             len(all_queries),
             len(sources),
+            len(evidence_block),
+            len(cited),
             len(report),
         )
+        if not cited:
+            # 근거를 줬는데 한 건도 인용하지 않았다 — 보고서가 근거 없이 쓰였다는 뜻이라
+            # 그대로 두면 안 된다. 출처는 비우되 사유는 남긴다.
+            logger.warning(
+                "DeepResearch: 근거 %d건을 줬으나 본문 인용 0건 (방=%s)",
+                len(sources),
+                profile.project_id,
+            )
         yield {
             "stage": "done",
             "report": report,
-            "sources": [self._source_dict(n, h) for n, h in enumerate(sources, 1)],
+            "sources": [self._source_dict(n, sources[n - 1]) for n in cited],
             "sub_queries": all_queries,
         }
 
@@ -491,8 +545,14 @@ class DeepResearchService:
         return ranked[: max(1, max_chunks)]
 
     @staticmethod
-    def _evidence_block(sources: list[SearchHit]) -> str:
-        """[n] 번호 목록 텍스트 — 총량 상한 초과 시 뒤(낮은 score)부터 절단."""
+    def _evidence_block(sources: list[SearchHit]) -> tuple[str, list[SearchHit]]:
+        """[n] 번호 목록 텍스트와 **실제로 담긴 근거**를 함께 돌려준다.
+
+        총량 상한 초과 시 뒤(낮은 score)부터 절단하는데, 잘라낸 것을 호출자가 모르면
+        참고문헌 목록에는 남아 출처로 표시된다. 모델이 읽지도 않은 문서에 인용 번호가
+        붙는다는 뜻이고, 그건 지어낸 근거와 구분되지 않는다 (E-96이 노트 자기인용을
+        막은 것과 같은 표면). 그래서 남긴 것만 돌려주고 호출자가 그걸로 갈아끼운다.
+        """
         lines: list[str] = []
         total = 0
         for n, h in enumerate(sources, 1):
@@ -502,7 +562,7 @@ class DeepResearchService:
                 break
             lines.append(entry)
             total += len(entry)
-        return "\n".join(lines)
+        return "\n".join(lines), sources[: len(lines)]
 
     @staticmethod
     def _source_dict(n: int, h: SearchHit) -> dict[str, Any]:

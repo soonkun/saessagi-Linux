@@ -1,14 +1,16 @@
 #!/usr/bin/env bash
-# 새싹이.sh — 이것 하나만 실행하면 필요한 모든 것이 켜진다.
+# start.sh — 이것 하나만 실행하면 필요한 모든 것이 켜진다.
 #
-#     ./새싹이.sh
+#     ./start.sh
 #
 # 켜는 것 (conf.yaml 설정에 따라 자동 판단):
 #   1. 프론트엔드 빌드 (소스가 빌드보다 새로울 때만)
 #   2. Ollama
 #   3. Neo4j            — app.graphrag.enabled 가 true일 때만
 #   4. 백엔드           — RAG 폴더 감시·자동 시딩은 백엔드가 알아서 한다
-#   5. 외부 접속 주소   — cloudflared가 있으면 자동 (--local 로 생략)
+#   5. 워치독           — 백엔드가 죽으면 되살린다 (이미 돌고 있으면 그대로 둔다)
+#   6. 외부 접속 주소   — cloudflared가 있으면 자동 (--local 로 생략).
+#                        받은 주소는 ../접속주소.txt 에도 기록한다.
 #
 # 옵션:
 #   --local      외부 접속 주소를 만들지 않는다 (서버 안에서만 사용)
@@ -21,6 +23,7 @@ cd "$ROOT"
 PY="$ROOT/.venv/bin/python"
 RUN_DIR="$ROOT/data/run"
 LOG_DIR="$ROOT/data/logs"
+ADDR_FILE="$ROOT/../접속주소.txt"
 mkdir -p "$RUN_DIR" "$LOG_DIR"
 
 # 두 곳에서 동시에 띄우지 않는다 (E-89).
@@ -186,12 +189,22 @@ if [ -s "$LOG_DIR/backend.log" ]; then
 fi
 setsid --fork nohup "$PY" -m app.main >"$LOG_DIR/backend.log" 2>&1 </dev/null 9>&- &
 
+# 기다리는 시간으로 "느린 기동"과 "죽은 기동"을 구분하려 하면 둘 중 하나는 반드시 틀린다.
+# 180초 벽에 실제로 걸렸다: 콜드 캐시(NFS)에서 모델 로딩이 178초 걸린 날, 백엔드는 멀쩡히
+# 뜨는 중인데 런처가 2초 차이로 먼저 포기하고 exit 1 했다. 그 바람에 워치독도 터널도
+# 켜지지 않아 접속 주소가 아예 없었다 (백엔드만 홀로 살아 있었다).
+# 그래서 시간은 넉넉히 주고, 포기 판단은 시계가 아니라 프로세스 생사로 한다.
 BE_READY=0
-for _ in $(seq 1 180); do
+for i in $(seq 1 600); do
     sleep 1
     if curl -sf -o /dev/null "http://127.0.0.1:$PORT/login" 2>/dev/null \
        || curl -sf -o /dev/null "http://127.0.0.1:$PORT/" 2>/dev/null; then
         BE_READY=1; break
+    fi
+    # 처음 10초는 setsid가 아직 fork 전일 수 있으므로 생사 판정을 미룬다.
+    # 패턴은 백엔드 명령줄(`python -m app.main`)에만 걸린다 — 런처 자신은 `bash ./start.sh`.
+    if [ "$i" -gt 10 ] && ! pgrep -f 'python.*-m app\.main' >/dev/null 2>&1; then
+        break
     fi
 done
 
@@ -215,7 +228,24 @@ if [ "$WATCH_ON" = "True" ] || [ "$WATCH_ON" = "true" ]; then
     ok "RAG 폴더 감시: $WATCH_ROOT"
 fi
 
-# ── 6. 외부 접속 주소 ────────────────────────────────────────────────────────
+# ── 6. 워치독 ────────────────────────────────────────────────────────────────
+# 워치독은 백엔드가 죽으면 이 스크립트를 다시 부른다. 그 경로로 들어온 실행이 워치독을
+# 또 띄우면 감시자가 계속 불어나므로, 이미 돌고 있으면 손대지 않는다.
+# `9>&-`는 런처 락(fd 9)을 물려주지 않기 위한 것 — 물려주면 워치독이 사는 내내 락이
+# 안 풀려 다음 실행이 10분간 멈춘다 (E-89와 같은 함정).
+if pgrep -f 'backend_watchdog\.sh' >/dev/null 2>&1; then
+    ok "워치독 실행 중"
+else
+    setsid nohup bash "$ROOT/scripts/backend_watchdog.sh" >/dev/null 2>&1 </dev/null 9>&- &
+    sleep 1
+    if pgrep -f 'backend_watchdog\.sh' >/dev/null 2>&1; then
+        ok "워치독 시작"
+    else
+        warn "워치독을 띄우지 못했습니다 — 백엔드가 죽어도 자동 복구되지 않습니다"
+    fi
+fi
+
+# ── 7. 외부 접속 주소 ────────────────────────────────────────────────────────
 URL=""
 if [ "$WANT_TUNNEL" -eq 1 ]; then
     CF="$ROOT/../opt/bin/cloudflared"
@@ -238,7 +268,13 @@ if [ "$WANT_TUNNEL" -eq 1 ]; then
                 sleep 2
                 curl -sf -o /dev/null -m 10 "$URL/login" 2>/dev/null && break
             done
-            ok "외부 접속 주소 준비"
+            # 주소를 파일에도 남긴다. quick tunnel이라 켤 때마다 이름이 바뀌는데, 터미널
+            # 출력만으로는 창을 닫으면 사라진다. **주소를 받은 경우에만** 쓴다 —
+            # 실패했을 때 빈 값으로 덮으면 아직 살아 있는 예전 주소까지 잃는다.
+            # `--local`은 이 블록에 오지 않으므로 기존 주소가 그대로 보존된다.
+            echo "$URL" > "$ADDR_FILE" 2>/dev/null \
+                && ok "외부 접속 주소 준비 (${ADDR_FILE##*/}에 기록)" \
+                || ok "외부 접속 주소 준비"
         else
             warn "외부 주소를 받지 못했습니다 (인터넷 연결 확인) — 서버 안에서는 사용 가능"
         fi
@@ -267,5 +303,5 @@ if [ "$AUTH" = "True" ] || [ "$AUTH" = "true" ]; then
 fi
 echo ""
 echo "  이 터미널 창은 닫아도 됩니다. 계속 켜져 있습니다."
-echo "  끄기:  ./새싹이끄기.sh"
+echo "  끄기:  ./stop.sh"
 echo ""

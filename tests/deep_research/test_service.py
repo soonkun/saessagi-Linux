@@ -52,6 +52,7 @@ class FakeAgent:
         self.json_calls = 0
         self.text_calls = 0
         self.last_system_prompt = ""
+        self.last_user_prompt = ""
         # CR-62: 플래너·격차·종합에 각각 어떤 system이 갔는지 봐야 방 설정 반영을 검증할 수 있다.
         self.system_prompts: list[str] = []
 
@@ -69,6 +70,8 @@ class FakeAgent:
     async def complete_text(self, system_prompt: str, user_prompt: str, **kw: Any) -> str:
         self.text_calls += 1
         self.last_system_prompt = system_prompt
+        # 근거가 실제로 모델에 닿았는지는 user 프롬프트 본문으로만 확인할 수 있다.
+        self.last_user_prompt = user_prompt
         self.system_prompts.append(system_prompt)
         return self.report
 
@@ -131,7 +134,8 @@ async def _collect(gen: Any) -> list[dict[str, Any]]:
 class TestPipeline:
     @pytest.mark.asyncio
     async def test_full_pipeline_event_order_and_done(self) -> None:
-        agent = FakeAgent(plan_queries=["q1", "q2"])
+        # 출처는 본문이 인용한 것만 나가므로, 근거 2건을 둘 다 인용하는 보고서를 쓴다.
+        agent = FakeAgent(plan_queries=["q1", "q2"], report="## 보고서\n내용 [1] 그리고 [2]")
         graph = FakeGraphRag({"q1": [_hit("c1")], "q2": [_hit("c2", doc="문서B")]})
         svc = DeepResearchService(agent, FakeRag([]), graph)
 
@@ -152,6 +156,81 @@ class TestPipeline:
         assert done["sources"][0]["n"] == 1
         assert done["sub_queries"] == ["q1", "q2"]
         assert agent.text_calls == 1
+
+    @pytest.mark.asyncio
+    async def test_max_evidence_actually_reaches_the_model(self) -> None:
+        """방이 고른 근거가 **프롬프트 본문까지** 도달하는가.
+
+        상수 값이 바뀐 걸 보는 게 아니라 user 프롬프트에 [80]번 항목이 실제로 있는지 본다.
+        _MAX_EVIDENCE_CHARS가 14,000이던 시절 이 테스트는 [14]쯤에서 멈춰 실패한다 —
+        방은 40건을 고르는데 모델은 14건만 받던 그 누수다.
+        """
+        hits = [
+            _hit(f"c{i}", text="가" * 1000, score=1.0 - i / 1000, doc=f"문서{i}") for i in range(80)
+        ]
+        agent = FakeAgent(plan_queries=["q1"], report=" ".join(f"[{i}]" for i in range(1, 81)))
+        graph = FakeGraphRag({"q1": hits})
+        svc = DeepResearchService(agent, FakeRag([]), graph)
+
+        profile = _profile("wide", top_k_per_query=80, max_evidence_chunks=80)
+        done = (await _collect(svc.run(profile, "질문")))[-1]
+
+        assert "[80] " in agent.last_user_prompt  # 80번째가 물리적으로 모델에 닿았다
+        assert len(done["sources"]) == 80  # 참고문헌 수가 일치한다
+        assert len(agent.last_user_prompt) > 80_000  # 번호만이 아니라 본문이 들어갔다
+
+    @pytest.mark.asyncio
+    async def test_sources_never_list_evidence_the_model_did_not_read(self) -> None:
+        """총량 상한에 걸려 잘린 근거는 출처 목록에서도 빠진다.
+
+        읽지 않은 문서에 인용 번호가 붙으면 지어낸 근거와 구분되지 않는다. 실제로
+        모델이 보고서에 "[11]~[24]번 문서는 원문이 제공되지 않아 제외"라고 적어 항의했다.
+        """
+        # 2,000자 × 80건 = 16만자 → 90,000자 상한에 반드시 걸린다.
+        hits = [
+            _hit(f"c{i}", text="나" * 2000, score=1.0 - i / 1000, doc=f"문서{i}") for i in range(80)
+        ]
+        agent = FakeAgent(plan_queries=["q1"], report=" ".join(f"[{i}]" for i in range(1, 81)))
+        graph = FakeGraphRag({"q1": hits})
+        svc = DeepResearchService(agent, FakeRag([]), graph)
+
+        profile = _profile("cut", top_k_per_query=80, max_evidence_chunks=80)
+        done = (await _collect(svc.run(profile, "질문")))[-1]
+
+        n = len(done["sources"])
+        assert 0 < n < 80  # 상한에 걸려 잘렸다
+        assert f"[{n}] " in agent.last_user_prompt  # 마지막 출처는 모델이 읽었고
+        assert f"[{n + 1}] " not in agent.last_user_prompt  # 그 너머는 목록에도 없다
+
+    @pytest.mark.asyncio
+    async def test_only_cited_sources_are_returned(self) -> None:
+        """출처는 **본문이 실제로 인용한 것만** 나간다.
+
+        실측: 근거 40건을 준 보고서가 본문에서 인용한 것은 22건뿐이었다. 나머지 18건도
+        출처로 나가서, 사용자에게는 "참조했다"로 보이지만 답변에는 반영이 없었다.
+        번호는 보고서에 적힌 그대로 유지한다 — 다시 매기면 본문의 [n]과 어긋난다.
+        """
+        hits = [_hit(f"c{i}", score=0.9 - i / 100, doc=f"문서{i}") for i in range(3)]
+        agent = FakeAgent(plan_queries=["q1"], report="2번만 씁니다 [2].")
+        svc = DeepResearchService(agent, FakeRag([]), FakeGraphRag({"q1": hits}))
+
+        done = (await _collect(svc.run(_profile("cite", top_k_per_query=3), "질문")))[-1]
+
+        assert [s["n"] for s in done["sources"]] == [2], "인용한 것만, 번호는 그대로"
+
+    @pytest.mark.asyncio
+    async def test_grouped_and_hallucinated_citations(self) -> None:
+        """`[1, 3]` 묶음 인용을 인식하고, 범위 밖 번호는 버린다.
+
+        묶음을 못 읽으면 실제 쓰인 자료가 출처에서 빠진다 (실측 22건 중 5건이 묶음이었다).
+        """
+        hits = [_hit(f"c{i}", score=0.9 - i / 100, doc=f"문서{i}") for i in range(3)]
+        agent = FakeAgent(plan_queries=["q1"], report="근거 [1, 3] 그리고 없는 것 [99].")
+        svc = DeepResearchService(agent, FakeRag([]), FakeGraphRag({"q1": hits}))
+
+        done = (await _collect(svc.run(_profile("grp", top_k_per_query=3), "질문")))[-1]
+
+        assert [s["n"] for s in done["sources"]] == [1, 3], "묶음 인식 + 환각 번호 제외"
 
     @pytest.mark.asyncio
     async def test_duplicate_chunks_merged(self) -> None:
@@ -202,7 +281,7 @@ class TestPipeline:
 
     @pytest.mark.asyncio
     async def test_gap_queries_extend_search(self) -> None:
-        agent = FakeAgent(plan_queries=["q1"], gap_queries=["보완질의"])
+        agent = FakeAgent(plan_queries=["q1"], gap_queries=["보완질의"], report="본문 [1][2]")
         # 서로 다른 문서 → 참고자료 2건 (gap 질의가 새 문서를 추가)
         graph = FakeGraphRag(
             {"q1": [_hit("c1", doc="문서A")], "보완질의": [_hit("c2", doc="문서B")]}

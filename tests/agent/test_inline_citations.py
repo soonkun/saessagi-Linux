@@ -42,10 +42,10 @@ def test_marker_stays_in_place() -> None:
 def test_hallucinated_document_is_removed() -> None:
     """검색 결과에 없는 문서명은 지운다 — 없는 자료로 링크를 만들면 안 된다."""
     text = "그럴듯한 주장입니다. [[doc:존재하지않는보고서.pdf_deadbeef]]"
-    out, _ = _resolve_inline_markers(text, [f"[[doc:{_DOC}]]"])
+    out, kept = _resolve_inline_markers(text, [f"[[doc:{_DOC}]]"])
     assert "존재하지않는" not in out, "없는 문서로 링크를 만들면 안 된다"
-    # 본문 인용은 사라졌지만 실제 검색된 자료는 끝에 보태져 접근 경로가 남는다
-    assert f"[[doc:{_DOC}]]" in out
+    # 환각 인용을 지우고 나면 남는 게 없다 — 검색만 된 자료를 대신 붙이지 않는다.
+    assert kept == 0 and "[[doc:" not in out
 
 
 def test_corrupted_filename_is_repaired() -> None:
@@ -87,14 +87,19 @@ def test_repeats_are_kept_for_each_section() -> None:
     assert out.count("[[doc:") == 2
 
 
-def test_uncited_documents_are_appended() -> None:
-    """모델이 빠뜨린 자료는 끝에 보탠다 — 버리면 접근 경로가 사라진다."""
+def test_uncited_documents_are_not_shown() -> None:
+    """검색만 되고 본문에 안 쓰인 자료는 표시하지 않는다.
+
+    예전에는 끝에 몰아 붙였다("참고했으면 다 달아야지"). 그런데 컨텍스트에 넣는 것과
+    모델이 답변에 쓰는 것은 달라서, 반영도 안 된 자료가 근거처럼 보였다 (사용자 지적:
+    "분명 참조한 문서가 있는데 본문엔 반영을 안한 듯하게 나오거든").
+    """
     other = "다른보고서.pdf_beef"
     markers = [f"[[doc:{_DOC}]]", f"[[doc:{other}]]"]
     out, kept = _resolve_inline_markers(f"본문. [[doc:{_DOC}]]", markers)
-    assert f"[[doc:{other}]]" in out, "인용 안 된 자료가 사라졌다"
-    assert out.index(_DOC) < out.index(other), "본문 인용이 앞, 보탠 것이 뒤여야 한다"
-    assert kept == 2
+    assert f"[[doc:{other}]]" not in out, "인용 안 된 자료가 표시됐다"
+    assert f"[[doc:{_DOC}]]" in out, "인용된 자료는 제자리에 남아야 한다"
+    assert kept == 1
 
 
 # ── 재진입 (E-106) ────────────────────────────────────────────────────────────
