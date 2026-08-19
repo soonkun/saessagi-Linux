@@ -42,7 +42,7 @@ while true; do
                 # bind에 실패하고, 그 과정에서 로그가 덮인다.
                 # 락은 런처가 직접 잡는다(여기서 flock으로 감싸면 그 fd를 백엔드가
                 # 물려받아 락이 영영 안 풀린다). 못 잡으면 런처가 75로 물러난다.
-                SAESSAGI_LOCK_NOWAIT=1 "$ROOT/새싹이.sh" --no-build --local >> "$WD_LOG" 2>&1
+                SAESSAGI_LOCK_NOWAIT=1 "$ROOT/start.sh" --no-build --local >> "$WD_LOG" 2>&1
                 rc=$?
                 if [ "$rc" -eq 0 ]; then
                     echo "$(date '+%F %T') 재시작 완료" >> "$WD_LOG"

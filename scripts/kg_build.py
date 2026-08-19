@@ -133,7 +133,7 @@ def cmd_load(args: argparse.Namespace) -> int:
 
     graph = build_graph_store(app)
     if not graph.ping():
-        print("Neo4j에 연결할 수 없습니다. ./새싹이.sh 로 기동했는지 확인하세요.", file=sys.stderr)
+        print("Neo4j에 연결할 수 없습니다. ./start.sh 로 기동했는지 확인하세요.", file=sys.stderr)
         return 2
     if args.purge_legacy:
         print("M_19 키워드 그래프를 삭제하고 적재합니다 (되돌릴 수 없음).")

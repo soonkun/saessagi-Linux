@@ -131,7 +131,7 @@ grep "model: gemma" conf.yaml
 ## 5. 실행
 
 ```bash
-./새싹이.sh
+./start.sh
 ```
 
 런처가 순서대로 처리한다:
