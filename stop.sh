@@ -57,7 +57,13 @@ stop_pidfile "외부 접속 주소" cloudflared.pid
 stop_pidfile "백엔드" backend.pid
 
 if [ "$BACKEND_ONLY" -eq 0 ]; then
-    stop_port "Ollama" 11434
+    # CR-74: 11434가 진짜 Ollama일 때만 끈다. NHN 서버에서는 vLLM 호환 문(../vllm-gateway)이 이 포트에 있고
+    # 다른 서비스와 같이 쓰므로 새싹이를 끌 때 같이 내리지 않는다.
+    if ss -tlnp 2>/dev/null | grep ":11434 " | grep -q '"ollama"'; then
+        stop_port "Ollama" 11434
+    else
+        echo "  Ollama 없음 (11434는 vLLM 호환 문 — 그대로 둠)"
+    fi
     stop_port "Neo4j" 7687 60   # 종료(체크포인트)에 오래 걸릴 수 있다
 fi
 

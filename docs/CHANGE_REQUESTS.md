@@ -3283,3 +3283,52 @@ document_type 2종(RFP 6,461 · FINAL_REPORT 5,609).
 **flex 자식의 `flex:1`은 부모 높이가 확정되어야 동작한다.** "아래에 고정"이 안 될 때
 고정하려는 요소를 보기 전에 **조상 사슬의 높이가 어디서 끊겼는지** 먼저 볼 것.
 이번에도 입력창 쪽 스타일에는 문제가 없었다.
+
+---
+
+## CR-74: NHN 서버의 추론을 Ollama에서 vLLM으로 (2026-10-03)
+
+**요청(소유자)**: "새싹이 NHN 클라우드도 vLLM으로 넘어가고 Ollama는 지워야지." 같은 서버의 MOPAN은 9월부터 vLLM을 쓰고
+있었고, Ollama는 새싹이만 쓰는 채로 206GB의 모델과 함께 남아 있었다. 10월 2일 Ollama 로그에는 GPU 탐색 실패
+(`llama-server GPU discovery watchdog timed out`)도 찍히고 있었다.
+
+### 무엇을 바꿨나
+
+새싹이 코드는 바꾸지 않았다. **PC 배포판은 계속 진짜 Ollama를 쓰기 때문**에 Ollama 쪽 코드(네이티브 `/api/chat`,
+`/api/tags`, `think=false`)를 걷어낼 수 없다. 대신 서버 쪽에서 맞췄다:
+
+- `../vllm-gateway/gateway.py`가 **11434에서 Ollama API로 답하고** 요청을 모델 이름에 맞는 vLLM 서버로 넘긴다.
+  `/v1/chat/completions`(대화·이미지, 스트림)은 그대로, 네이티브 `/api/chat`(지식그래프 추출의 `format` 스키마,
+  `think`, `options`)은 OpenAI 형식으로 바꿔 넘기고 Ollama 모양으로 돌려준다. `/api/version`·`/api/tags`·`/api/ps`도 답한다.
+  메시지 없는 `/api/chat`(미리 올리기·내리기)는 자는 vLLM을 깨우기만 한다.
+- `conf.yaml` `deep_research.ollama_model`: `gemma4:31b` → `gemma4:26b`. 31b는 vLLM에 없다. 나머지는 원래 26b였다.
+- vLLM의 `gemma4:26b`(8001)는 창을 16k → **131k**로 올렸다 - `agent.max_context_tokens` 기본값(131,000)에 맞춘 것.
+- `start.sh` 3단계: 11434가 호환 문이면 그대로 쓰고, `ollama` 명령이 없고 `../vllm-gateway`가 있으면 그 문을 띄운다.
+  `stop.sh`: 11434가 진짜 Ollama일 때만 끈다(호환 문은 다른 서비스와 같이 쓴다). `daily_report.py`의 표시 이름.
+
+### 달라지는 것 (알고 써야 하는 것)
+
+- 설정 화면의 모델 목록은 vLLM이 내는 이름이다: `gemma4:26b`, `gemma4:e4b`, `qwen3.8:27b`, `muse-glimmer:30b`
+  (`qwen3-embedding:8b`는 임베딩용 - 대화 모델로 고르면 오류). Ollama에만 있던 `gemma4:31b`·`gpt-oss:120b`·
+  `granite4.1`·`mistral-medium-3.5:128b`는 없다 - 고르면 404.
+- `keep_alive`는 의미가 없다. vLLM은 MOPAN 쪽이 30분 유휴 뒤 재우고(sleep), 문이 요청 때 깨운다(수 초).
+- `OLLAMA_NUM_PARALLEL`도 의미가 없다 - vLLM은 연속 배칭이라 동시 요청을 그대로 받는다.
+- Muse Glimmer는 `think=false`로 생각을 끌 수 없다(시스템 글의 `Reasoning strength`로만 줄인다) - 새싹이 대화 모델로는 권하지 않는다.
+
+### 검증
+
+새싹이의 실제 클라이언트 코드로 문을 불렀다(2026-10-03): `JsonCompletionClient`(네이티브+스키마) 추출 결과 정상,
+`NoThinkLLM` 스트림 첫 토큰 0.07초, 이미지 글자 읽기 정상, `OllamaLLM` 미리 올리기 200. 전환 뒤 `scripts/ws_test.py` 결과는
+아래 "전환 뒤 확인"에 적는다.
+
+### 전환 뒤 확인 (2026-10-03 01:18~, Ollama 프로세스 종료·삭제 후)
+
+- `./start.sh --local --no-build`로 백엔드만 다시 띄움 - 외부 접속 주소는 그대로.
+- `scripts/ws_test.py "벼 이앙 적기를 한 문장으로 알려줘."`: 오디오 2개 수신, `conversation-chain-end`. 백엔드 로그
+  `IntentGate: intent=doc_query conf=0.95 source=llm`(폴백이 아니라 LLM 판정), `RAG 컨텍스트 주입: 검색 hits=10`.
+  호환 문 로그에 그 턴의 `POST /v1/chat/completions` 2건(의도 분류 + 답변).
+- Ollama를 지운 뒤 한 번 더: 인사말 턴도 오디오 수신. 서버에 `ollama` 명령·모델 폴더(206GB)는 없다.
+- 확인하지 못한 것: 딥 리서치 실행, 지식그래프 추출을 실제 문서 업로드로 돌려 보는 것, 회의록. 호환 문의 네이티브
+  `/api/chat`+스키마 경로는 `JsonCompletionClient`로 직접 불러 확인했지만 업로드 흐름 전체는 아니다.
+- 기동 로그의 `Error initializing Live2D: model_dict.json`은 이번 변경 이전(9월 기동 때)부터 있던 것이다.
+

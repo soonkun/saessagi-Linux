@@ -124,8 +124,18 @@ if [ "$SKIP_BUILD" -eq 0 ] && ! node "$ROOT/web/scripts/check-rebuild.mjs" 2>/de
 fi
 
 # ── 3. Ollama ────────────────────────────────────────────────────────────────
-if curl -sf http://127.0.0.1:11434/api/version >/dev/null 2>&1; then
+# CR-74: NHN 서버에는 Ollama가 없다. 추론은 vLLM이 하고, 11434에는 Ollama API 호환 문(../vllm-gateway)이 떠서
+# 새싹이의 요청을 모델 이름에 맞는 vLLM 서버로 넘긴다. PC 배포판(진짜 Ollama)은 아래 else 갈래를 그대로 탄다.
+if curl -sf http://127.0.0.1:11434/api/version 2>/dev/null | grep -q vllm-gateway; then
+    ok "LLM 서버: vLLM (Ollama API 호환 문 실행 중)"
+elif curl -sf http://127.0.0.1:11434/api/version >/dev/null 2>&1; then
     ok "Ollama 실행 중"
+elif ! command -v ollama >/dev/null 2>&1 && [ -x "$ROOT/../vllm-gateway/start.sh" ]; then
+    if "$ROOT/../vllm-gateway/start.sh" >/dev/null 2>&1 && curl -sf http://127.0.0.1:11434/api/version >/dev/null 2>&1; then
+        ok "LLM 서버: vLLM (Ollama API 호환 문 시작)"
+    else
+        warn "vLLM 호환 문이 응답하지 않습니다 — LLM 대화가 안 될 수 있습니다 (../vllm-gateway/data/gateway.log)"
+    fi
 else
     # OLLAMA_NUM_PARALLEL: 기본값이면 요청이 서버에서 줄을 서서 동시 호출 효과가 거의
     # 없다(실측 1.26배). 4로 켜면 지식그래프 추출 처리량이 2.07배가 된다
